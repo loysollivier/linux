@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# inv-icm drivers for Invensense ICM devices
+#
+
+config INV_ICM_I2C
+	tristate "Invensense ICM devices (I2C)"
+	depends on I2C_MUX
+	select REGMAP_I2C
+	help
+	  This driver supports the Invensense ICM20948 motion tracking
+          devices over I2C.
+	  This driver can be built as a module. The module will be called
+	  inv-icm-i2c.
