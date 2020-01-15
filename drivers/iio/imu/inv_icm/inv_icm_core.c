@@ -19,8 +19,10 @@
 #include "inv_icm_iio.h"
 
 static const struct inv_icm_reg_map reg_set_20948 = {
-	.sample_rate_div	= INV_ICM20948_REG_SAMPLE_RATE_DIV,
-	.lpf                    = INV_ICM20948_REG_CONFIG,
+	.gyro_smplrt_div	= INV_ICM20948_REG_GYRO_SMPLRT_DIV,
+	.accel_smplrt_div	= INV_ICM20948_REG_ACCEL_SMPLRT_DIV,
+	.gyro_lpf               = INV_ICM20948_REG_CONFIG,
+	.accel_lpf              = INV_ICM20948_REG_ACCEL_CONFIG,
 	.user_ctrl              = INV_ICM20948_REG_USER_CTRL,
 	.fifo_en                = INV_ICM20948_REG_FIFO_EN_1, // TODO edited
 	.gyro_config            = INV_ICM20948_REG_GYRO_CONFIG,
@@ -41,8 +43,12 @@ static const struct inv_icm_reg_map reg_set_20948 = {
 
 static const struct inv_icm_chip_config chip_config_20948 = {
 	.fsr = INV_ICM20948_FSR_2000DPS,
-	.lpf = INV_ICM20948_FILTER_20HZ,
-	.divider = INV_ICM20948_FIFO_RATE_TO_DIVIDER(INV_ICM20948_INIT_FIFO_RATE),
+	.gyro_lpf = INV_ICM20948_GYRO_FILTER_18HZ,
+	.accel_lpf = INV_ICM20948_ACCEL_FILTER_17HZ,
+	.gyro_div = INV_ICM20948_FIFO_RATE_TO_DIVIDER(INV_ICM20948_GYRO_FREQ_HZ,
+						      INV_ICM20948_INIT_FIFO_RATE),
+	.accel_div = INV_ICM20948_FIFO_RATE_TO_DIVIDER(INV_ICM20948_ACCEL_FREQ_HZ,
+						       INV_ICM20948_INIT_FIFO_RATE),
 	.gyro_fifo_enable = false,
 	.accl_fifo_enable = false,
 	.magn_fifo_enable = false,
@@ -60,6 +66,225 @@ static const struct inv_icm_hw hw_info[] = {
 		.fifo_size = 512,
 	},
 };
+
+int inv_icm_switch_engine(struct inv_icm_state *st, bool en, u32 mask)
+{
+	unsigned int d, mgmt_1;
+	int result;
+	/*
+	 * switch clock needs to be careful. Only when gyro is on, can
+	 * clock source be switched to gyro. Otherwise, it must be set to
+	 * internal clock
+	 */
+	if (mask == INV_ICM20948_BIT_PWR_GYRO_STBY) {
+		result = regmap_read(st->map, st->reg->pwr_mgmt_1, &mgmt_1);
+		if (result)
+			return result;
+
+		mgmt_1 &= ~INV_ICM20948_BIT_CLK_MASK;
+	}
+
+	if ((mask == INV_ICM20948_BIT_PWR_GYRO_STBY) && (!en)) {
+		/*
+		 * turning off gyro requires switch to internal clock first.
+		 * Then turn off gyro engine
+		 */
+		mgmt_1 |= INV_CLK_INTERNAL;
+		result = regmap_write(st->map, st->reg->pwr_mgmt_1, mgmt_1);
+		if (result)
+			return result;
+	}
+
+	result = regmap_read(st->map, st->reg->pwr_mgmt_2, &d);
+	if (result)
+		return result;
+	if (en)
+		d &= ~mask;
+	else
+		d |= mask;
+	result = regmap_write(st->map, st->reg->pwr_mgmt_2, d);
+	if (result)
+		return result;
+
+	if (en) {
+		/* Wait for output to stabilize */
+		msleep(INV_ICM20948_TEMP_UP_TIME);
+		if (mask == INV_ICM20948_BIT_PWR_GYRO_STBY) {
+			/* switch internal clock to PLL */
+			mgmt_1 |= INV_CLK_PLL;
+			result = regmap_write(st->map,
+					      st->reg->pwr_mgmt_1, mgmt_1);
+			if (result)
+				return result;
+		}
+	}
+
+	return 0;
+}
+
+int inv_icm_set_power_itg(struct inv_icm_state *st, bool power_on)
+{
+	int result;
+
+	if (power_on) {
+		if (!st->powerup_count) {
+			result = regmap_write(st->map, st->reg->pwr_mgmt_1, 0);
+			if (result)
+				return result;
+			usleep_range(INV_ICM20948_REG_UP_TIME_MIN,
+				     INV_ICM20948_REG_UP_TIME_MAX);
+		}
+		st->powerup_count++;
+	} else {
+		// TODO fix this in the upstream driver ?
+		// Could be stuck if power_itg is called sev times.
+		if (st->powerup_count >= 1) {
+			result = regmap_write(st->map, st->reg->pwr_mgmt_1,
+					      INV_ICM20948_BIT_SLEEP);
+			if (result)
+				return result;
+		}
+		st->powerup_count--;
+	}
+
+	dev_dbg(regmap_get_device(st->map), "set power %d, count=%u\n",
+		power_on, st->powerup_count);
+
+	return 0;
+}
+
+/**
+ * inv_icm_userbank_write() - write a value to a single user bank register
+ *
+ * @st: pointer to the driver state
+ * @bank_reg: Register to write to, MSB u8 is user bank, LSB u8 is register
+ * @val: Value to be written
+ *
+ * A value of zero will be returned on success, a negative errno will
+ * be returned in error cases.
+ */
+int inv_icm_userbank_write(struct inv_icm_state *st,
+				  u16 bank_reg,
+				  u8 val)
+{
+	int result;
+	u8 bank;
+	u8 reg;
+
+	bank = (u8) bank_reg >> 8;
+	reg = (u8) bank_reg & 0xFF;
+
+	result = regmap_write(st->map, st->reg->bank_sel, bank);
+	if (result)
+		return result;
+
+	result = regmap_write(st->map, reg, val);
+	if (result)
+		return result;
+
+	/* Switch back to user bank 0 (default) */
+	result = regmap_write(st->map, st->reg->bank_sel, 0x00);
+
+	return result;
+}
+
+/**
+ *  inv_icm_set_lpf_regs() - set low pass filter registers for gyro and accel
+ *
+ * A value of zero will be returned on success, a negative errno will
+ * be returned in error cases.
+ */
+static int inv_icm_set_lpf_regs(struct inv_icm_state *st,
+				enum inv_icm_accel_filter_e acc_val,
+				enum inv_icm_gyro_filter_e gyr_val)
+{
+	int result;
+
+	/* set accel lpf */
+	result = inv_icm_userbank_write(st, st->reg->accel_lpf, acc_val);
+	if (result)
+		return result;
+
+	/* set gyro lpf */
+	result = inv_icm_userbank_write(st, st->reg->accel_lpf, gyr_val);
+	if (result)
+		return result;
+
+	/* set the user bank back to default (0) */
+	result = regmap_write(st->map, st->reg->bank_sel, 0x00);
+
+	return result;
+}
+
+/**
+ *  inv_icm_init_config() - Initialize hardware, disable FIFO.
+ *
+ *  Initial configuration:
+ *  FSR: ± 2000DPS
+ *  DLPF acc:  17Hz
+ *  DLPF gyro: 18Hz
+ *  FIFO rate: 50Hz
+ *  Clock source: Gyro PLL
+ */
+static int inv_icm_init_config(struct iio_dev *indio_dev)
+{
+	int result;
+	u8 d;
+	struct inv_icm_state *st = iio_priv(indio_dev);
+
+	result = inv_icm_set_power_itg(st, true);
+	if (result)
+		return result;
+
+	d = (INV_ICM20948_FS_02G << INV_ICM20948_ACCL_CONFIG_FSR_SHIFT);
+	result = inv_icm_userbank_write(st, st->reg->accl_config, d);
+	if (result)
+		goto error_power_off;
+
+	d = (INV_ICM20948_FSR_2000DPS << INV_ICM20948_GYRO_CONFIG_FSR_SHIFT);
+	result = inv_icm_userbank_write(st, st->reg->gyro_config, d);
+	if (result)
+		goto error_power_off;
+
+	result = inv_icm_set_lpf_regs(st, INV_ICM20948_ACCEL_FILTER_17HZ,
+				          INV_ICM20948_GYRO_FILTER_18HZ);
+	if (result)
+		goto error_power_off;
+
+	d = INV_ICM20948_FIFO_RATE_TO_DIVIDER(INV_ICM20948_ACCEL_FREQ_HZ,
+					      INV_ICM20948_INIT_FIFO_RATE);
+	result = inv_icm_userbank_write(st, st->reg->accel_smplrt_div, d);
+	if (result)
+		goto error_power_off;
+
+	d = INV_ICM20948_FIFO_RATE_TO_DIVIDER(INV_ICM20948_GYRO_FREQ_HZ,
+					      INV_ICM20948_INIT_FIFO_RATE);
+	result = inv_icm_userbank_write(st, st->reg->gyro_smplrt_div, d);
+	if (result)
+		goto error_power_off;
+
+	result = regmap_write(st->map, st->reg->int_pin_cfg, st->irq_mask);
+	if (result)
+		return result;
+
+	memcpy(&st->chip_config, hw_info[st->chip_type].config,
+	       sizeof(struct inv_icm_chip_config));
+
+	/*
+	 * Internal chip period is 1ms (1kHz).
+	 * Let's use at the beginning the theorical value before measuring
+	 * with interrupt timestamps.
+	 */
+	st->chip_period = NSEC_PER_MSEC;
+
+	// TODO removed magnetometer here
+
+	return inv_icm_set_power_itg(st, false);
+
+error_power_off:
+	inv_icm_set_power_itg(st, false);
+	return result;
+}
 
 /**
  *  inv_check_and_setup_chip() - check and setup chip.
@@ -104,12 +329,36 @@ static int inv_check_and_setup_chip(struct inv_icm_state *st)
 	if (result)
 		return result;
 	msleep(INV_ICM20948_POWER_UP_TIME);
-	// TODO function has been truncated
-	return 0;
+
+	/*
+	 * Turn power on. After reset, the sleep bit could be on
+	 * or off depending on the OTP settings. Turning power on
+	 * make it in a definite state as well as making the hardware
+	 * state align with the software state
+	 */
+	dev_warn(regmap_get_device(st->map), "ICM power\n");
+	result = inv_icm_set_power_itg(st, true);
+	if (result)
+		return result;
+
+	result = inv_icm_switch_engine(st, false,
+					   INV_ICM20948_BIT_PWR_ACCL_STBY);
+	if (result)
+		goto error_power_off;
+	result = inv_icm_switch_engine(st, false,
+					   INV_ICM20948_BIT_PWR_GYRO_STBY);
+	if (result)
+		goto error_power_off;
+
+	return inv_icm_set_power_itg(st, false);
+
+error_power_off:
+	inv_icm_set_power_itg(st, false);
+	return result;
 }
 
 int inv_icm_core_probe(struct regmap *regmap, int irq, const char *name,
-		int chip_type)
+		       int chip_type)
 {
 	struct inv_icm_state *st;
 	struct iio_dev *indio_dev;
@@ -177,10 +426,19 @@ int inv_icm_core_probe(struct regmap *regmap, int irq, const char *name,
 	if (result)
 		return result;
 
+	result = inv_icm_init_config(indio_dev);
+	if (result) {
+		dev_err(dev, "Could not initialize device.\n");
+		return result;
+	}
+
+	dev_set_drvdata(dev, indio_dev);
+	indio_dev->dev.parent = dev;
+	indio_dev->name = name;
+
 	return 0;
 }
-EXPORT_SYMBOL_GPL(inv_icm_core_probe);
 
-MODULE_AUTHOR("Invensense Corporation");
-MODULE_DESCRIPTION("Invensense device ICM20948 driver");
+MODULE_AUTHOR("Loys Ollivier <loys.ollivier@gmail.com>");
+MODULE_DESCRIPTION("Invensense ICM20948 driver");
 MODULE_LICENSE("GPL");

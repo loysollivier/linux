@@ -18,10 +18,13 @@
 #include <linux/iio/triggered_buffer.h>
 #include <linux/iio/trigger_consumer.h>
 
+//TODO fix whitespace
 /**
  *  struct inv_icm_reg_map - Notable registers.
- *  @sample_rate_div:	Divider applied to gyro output rate.
- *  @lpf:		Configures internal low pass filter.
+ *  @bank_sel:          User bank selector.
+ *  @gyro_smplrt_div:	Divider applied to gyro output rate.
+ *  @accel_smplrt_div:	Divider applied to accel output rate.
+ *  @gyro_lpf:		Configures gyroscope low pass filter.
  *  @accel_lpf:		Configures accelerometer low pass filter.
  *  @user_ctrl:		Enables/resets the FIFO.
  *  @fifo_en:		Determines which data will appear in FIFO.
@@ -42,13 +45,15 @@
  *  @i2c_if:		Controls the i2c interface
  */
 struct inv_icm_reg_map {
-	u8 sample_rate_div;
-	u8 lpf;
-	u8 accel_lpf;
+	u8 bank_sel;
+	u16 gyro_smplrt_div;
+	u16 accel_smplrt_div;
+	u16 gyro_lpf;
+	u16 accel_lpf;
 	u8 user_ctrl;
 	u8 fifo_en;
-	u8 gyro_config;
-	u8 accl_config;
+	u16 gyro_config;
+	u16 accl_config;
 	u8 fifo_count_h;
 	u8 fifo_r_w;
 	u8 raw_gyro;
@@ -73,21 +78,24 @@ enum inv_devices {
 /**
  *  struct inv_icm_chip_config - Cached chip configuration data.
  *  @fsr:		Full scale range.
- *  @lpf:		Digital low pass filter frequency.
+ *  @gyro_lpf:		Digital low pass filter frequency.
  *  @accl_fs:		accel full scale range.
  *  @accl_fifo_enable:	enable accel data output
  *  @gyro_fifo_enable:	enable gyro data output
  *  @magn_fifo_enable:	enable magn data output
- *  @divider:		chip sample rate divider (sample rate divider - 1)
+ *  @accel_div:	accel sample rate divider (sample rate divider - 1)
+ *  @gyro_div:		gyro sample rate divider (sample rate divider - 1)
  */
 struct inv_icm_chip_config {
 	unsigned int fsr:2;
-	unsigned int lpf:3;
+	unsigned int gyro_lpf:3;
+	unsigned int accel_lpf:3; // TODO this has been added
 	unsigned int accl_fs:2;
 	unsigned int accl_fifo_enable:1;
 	unsigned int gyro_fifo_enable:1;
 	unsigned int magn_fifo_enable:1;
-	u8 divider;
+	u8 gyro_div;
+	u8 accel_div;
 	u8 user_ctrl;
 };
 
@@ -154,10 +162,12 @@ struct inv_icm_state {
 };
 
 /*register and associated bit definition*/
+#define INV_ICM20948_REG_BANK_SEL            0x7F
 #define INV_ICM20948_REG_ACCEL_OFFSET        0x0120
 #define INV_ICM20948_REG_GYRO_OFFSET         0x0203
 
-#define INV_ICM20948_REG_SAMPLE_RATE_DIV     0x0200
+#define INV_ICM20948_REG_GYRO_SMPLRT_DIV     0x0200
+#define INV_ICM20948_REG_ACCEL_SMPLRT_DIV    0x0211
 #define INV_ICM20948_REG_CONFIG              0x0201
 #define INV_ICM20948_REG_GYRO_CONFIG         0x0202
 #define INV_ICM20948_REG_ACCEL_CONFIG        0x0214
@@ -198,7 +208,7 @@ struct inv_icm_state {
 #define INV_ICM20948_BIT_I2C_SLV2_NACK       0x04
 #define INV_ICM20948_BIT_I2C_SLV3_NACK       0x08
 
-// Todo replace by a dynamic define
+// TODO replace by a dynamic define
 #define INV_ICM20948_REG_INT_ENABLE_0        0x0010
 #define INV_ICM20948_REG_INT_ENABLE_1        0x0011
 #define INV_ICM20948_REG_INT_ENABLE_2        0x0012
@@ -273,11 +283,11 @@ struct inv_icm_state {
 #define INV_ICM20948_MAX_GYRO_FS_PARAM        3
 #define INV_ICM20948_MAX_ACCL_FS_PARAM        3
 #define INV_ICM20948_THREE_AXIS               3
-#define INV_ICM20948_GYRO_CONFIG_FSR_SHIFT    3
-#define INV_ICM20948_ACCL_CONFIG_FSR_SHIFT    3
+#define INV_ICM20948_GYRO_CONFIG_FSR_SHIFT    1
+#define INV_ICM20948_ACCL_CONFIG_FSR_SHIFT    1
 
 // TODO Fix whitespace
-#define INV_ICM20948_REG_INT_PIN_CFG	0x37
+#define INV_ICM20948_REG_INT_PIN_CFG	0x000F
 #define INV_ICM20948_ACTIVE_HIGH		0x00
 #define INV_ICM20948_ACTIVE_LOW		0x80
 /* enable level triggering */
@@ -292,32 +302,44 @@ struct inv_icm_state {
 #define INV_ICM20948_MAX_FIFO_RATE            1000
 #define INV_ICM20948_MIN_FIFO_RATE            4
 
-/* chip internal frequency: 1KHz */
-// TODO validate chip freq, looks like it's 1125 (see ACCEL_SMPLRT_DIV)
-#define INV_ICM20948_INTERNAL_FREQ_HZ		1000
+/* chip internal frequency */
+#define INV_ICM20948_ACCEL_FREQ_HZ		1125
+#define INV_ICM20948_GYRO_FREQ_HZ		1100
 /* return the frequency divider (chip sample rate divider + 1) */
 #define INV_ICM20948_FREQ_DIVIDER(st)					\
 	((st)->chip_config.divider + 1)
 /* chip sample rate divider to fifo rate */
-#define INV_ICM20948_FIFO_RATE_TO_DIVIDER(fifo_rate)			\
-	((INV_ICM20948_INTERNAL_FREQ_HZ / (fifo_rate)) - 1)
-#define INV_ICM20948_DIVIDER_TO_FIFO_RATE(divider)			\
-	(INV_ICM20948_INTERNAL_FREQ_HZ / ((divider) + 1))
+#define INV_ICM20948_FIFO_RATE_TO_DIVIDER(internal_freq, fifo_rate)	\
+	((internal_freq / (fifo_rate)) - 1)
+#define INV_ICM20948_DIVIDER_TO_FIFO_RATE(internal_freq, divider)	\
+	(internal_freq / ((divider) + 1))
 
 #define INV_ICM20948_REG_WHOAMI			0x0000
 
 #define INV_ICM20948_WHOAMI_VALUE		0xEA
 
-enum inv_icm_filter_e {
-	INV_ICM20948_FILTER_256HZ_NOLPF2 = 0,
-	INV_ICM20948_FILTER_188HZ,
-	INV_ICM20948_FILTER_98HZ,
-	INV_ICM20948_FILTER_42HZ,
-	INV_ICM20948_FILTER_20HZ,
-	INV_ICM20948_FILTER_10HZ,
-	INV_ICM20948_FILTER_5HZ,
-	INV_ICM20948_FILTER_2100HZ_NOLPF,
-	NUM_ICM20948_FILTER
+enum inv_icm_gyro_filter_e {
+	INV_ICM20948_GYRO_FILTER_230HZ = 0,
+	INV_ICM20948_GYRO_FILTER_188HZ,
+	INV_ICM20948_GYRO_FILTER_154Z,
+	INV_ICM20948_GYRO_FILTER_73HZ,
+	INV_ICM20948_GYRO_FILTER_36HZ,
+	INV_ICM20948_GYRO_FILTER_18HZ,
+	INV_ICM20948_GYRO_FILTER_9HZ,
+	INV_ICM20948_GYRO_FILTER_377HZ,
+	NUM_ICM20948_GYRO_FILTER
+};
+
+enum inv_icm_accel_filter_e {
+	INV_ICM20948_ACCEL_FILTER_265HZ_NOLPF = 0,
+	INV_ICM20948_ACCEL_FILTER_265HZ,
+	INV_ICM20948_ACCEL_FILTER_136HZ,
+	INV_ICM20948_ACCEL_FILTER_69Z,
+	INV_ICM20948_ACCEL_FILTER_34HZ,
+	INV_ICM20948_ACCEL_FILTER_17HZ,
+	INV_ICM20948_ACCEL_FILTER_8HZ,
+	INV_ICM20948_ACCEL_FILTER_499HZ,
+	NUM_ICM20948_ACCEL_FILTER
 };
 
 /* IIO attribute address */
@@ -342,8 +364,16 @@ enum inv_icm_fsr_e {
 	NUM_ICM20948_FSR
 };
 
+enum inv_icm_clock_sel_e {
+	INV_CLK_INTERNAL = 0,
+	INV_CLK_PLL,
+	NUM_CLK
+};
 
 int inv_icm_core_probe(struct regmap *regmap, int irq, const char *name,
 		       int chip_type);
+int inv_icm_set_power_itg(struct inv_icm_state *st, bool power_on);
+int inv_icm_switch_engine(struct inv_icm_state *st, bool en, u32 mask);
+int inv_icm_userbank_write(struct inv_icm_state *st, u16 bank_reg, u8 val);
 
 #endif
