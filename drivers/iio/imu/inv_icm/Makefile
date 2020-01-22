@@ -3,5 +3,5 @@
 # Makefile for Invensense ICM20948 device.
 #
 
-obj-$(CONFIG_INV_ICM_I2C) += inv-icm-i2c.o inv_icm_core.o
+obj-$(CONFIG_INV_ICM_I2C) += inv-icm-i2c.o inv_icm_core.o inv_icm_ring.o inv_icm_trigger.o
 inv-icm-i2c-y := inv_icm_i2c.o

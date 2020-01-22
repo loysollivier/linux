@@ -52,6 +52,7 @@ struct inv_icm_reg_map {
 	u16 accel_lpf;
 	u8 user_ctrl;
 	u8 fifo_en;
+	u8 fifo_rst;
 	u16 gyro_config;
 	u16 accl_config;
 	u8 fifo_count_h;
@@ -266,8 +267,8 @@ struct inv_icm_state {
 #define INV_ICM20948_BYTES_PER_3AXIS_SENSOR   6
 #define INV_ICM20948_FIFO_COUNT_BYTE          2
 
-/* ICM20602 FIFO samples include temperature readings */
-#define INV_ICM20602_BYTES_PER_TEMP_SENSOR   2
+// TODO verify temp is enabled
+#define INV_ICM20948_BYTES_PER_TEMP_SENSOR   2
 
 /* delay time in milliseconds */
 #define INV_ICM20948_POWER_UP_TIME            100
@@ -285,6 +286,9 @@ struct inv_icm_state {
 #define INV_ICM20948_THREE_AXIS               3
 #define INV_ICM20948_GYRO_CONFIG_FSR_SHIFT    1
 #define INV_ICM20948_ACCL_CONFIG_FSR_SHIFT    1
+
+/* 6 + 6 + 2 (for ICM20948) = 14 round up to 24 and plus 8 */
+#define INV_ICM20948_OUTPUT_DATA_SIZE         32
 
 // TODO Fix whitespace
 #define INV_ICM20948_REG_INT_PIN_CFG	0x000F
@@ -306,8 +310,9 @@ struct inv_icm_state {
 #define INV_ICM20948_ACCEL_FREQ_HZ		1125
 #define INV_ICM20948_GYRO_FREQ_HZ		1100
 /* return the frequency divider (chip sample rate divider + 1) */
+// TODO same for accel ?
 #define INV_ICM20948_FREQ_DIVIDER(st)					\
-	((st)->chip_config.divider + 1)
+	((st)->chip_config.gyro_div + 1)
 /* chip sample rate divider to fifo rate */
 #define INV_ICM20948_FIFO_RATE_TO_DIVIDER(internal_freq, fifo_rate)	\
 	((internal_freq / (fifo_rate)) - 1)
@@ -370,10 +375,26 @@ enum inv_icm_clock_sel_e {
 	NUM_CLK
 };
 
+/* scan element definition for generic ICM devices */
+enum inv_icm_scan {
+	INV_ICM_SCAN_ACCL_X,
+	INV_ICM_SCAN_ACCL_Y,
+	INV_ICM_SCAN_ACCL_Z,
+	INV_ICM_SCAN_GYRO_X,
+	INV_ICM_SCAN_GYRO_Y,
+	INV_ICM_SCAN_GYRO_Z,
+	INV_ICM_SCAN_TIMESTAMP,
+};
+
+
 int inv_icm_core_probe(struct regmap *regmap, int irq, const char *name,
 		       int chip_type);
 int inv_icm_set_power_itg(struct inv_icm_state *st, bool power_on);
 int inv_icm_switch_engine(struct inv_icm_state *st, bool en, u32 mask);
 int inv_icm_userbank_write(struct inv_icm_state *st, u16 bank_reg, u8 val);
+irqreturn_t inv_icm_read_fifo(int irq, void *p);
+int inv_icm_probe_trigger(struct iio_dev *indio_dev, int irq_type);
+irqreturn_t inv_icm_read_fifo(int irq, void *p);
+int inv_reset_fifo(struct iio_dev *indio_dev);
 
 #endif

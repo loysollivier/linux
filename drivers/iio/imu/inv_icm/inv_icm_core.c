@@ -17,6 +17,20 @@
 #include <linux/platform_device.h>
 #include <linux/regulator/consumer.h>
 #include "inv_icm_iio.h"
+#include "inv_icm_channels.h"
+
+// TODO verify these two tables
+/*
+ * this is the gyro scale translated from dynamic range plus/minus
+ * {250, 500, 1000, 2000} to rad/s
+ */
+static const int gyro_scale[] = {133090, 266181, 532362, 1064724};
+
+/*
+ * this is the accel scale translated from dynamic range plus/minus
+ * {2, 4, 8, 16} to m/s^2
+ */
+static const int accel_scale[] = {598, 1196, 2392, 4785};
 
 static const struct inv_icm_reg_map reg_set_20948 = {
 	.gyro_smplrt_div	= INV_ICM20948_REG_GYRO_SMPLRT_DIV,
@@ -24,7 +38,8 @@ static const struct inv_icm_reg_map reg_set_20948 = {
 	.gyro_lpf               = INV_ICM20948_REG_CONFIG,
 	.accel_lpf              = INV_ICM20948_REG_ACCEL_CONFIG,
 	.user_ctrl              = INV_ICM20948_REG_USER_CTRL,
-	.fifo_en                = INV_ICM20948_REG_FIFO_EN_1, // TODO edited
+	.fifo_en                = INV_ICM20948_REG_FIFO_EN_2,
+	.fifo_rst		= INV_ICM20948_REG_FIFO_RST,
 	.gyro_config            = INV_ICM20948_REG_GYRO_CONFIG,
 	.accl_config            = INV_ICM20948_REG_ACCEL_CONFIG,
 	.fifo_count_h           = INV_ICM20948_REG_FIFO_COUNT_H,
@@ -32,7 +47,8 @@ static const struct inv_icm_reg_map reg_set_20948 = {
 	.raw_gyro               = INV_ICM20948_REG_RAW_GYRO,
 	.raw_accl               = INV_ICM20948_REG_RAW_ACCEL,
 	.temperature            = INV_ICM20948_REG_TEMPERATURE,
-	.int_enable             = INV_ICM20948_REG_INT_ENABLE_1, // TODO edited
+	.int_enable             = INV_ICM20948_REG_INT_ENABLE_1,
+	.int_status             = INV_ICM20948_REG_INT_STATUS_1,
 	.pwr_mgmt_1             = INV_ICM20948_REG_PWR_MGMT_1,
 	.pwr_mgmt_2             = INV_ICM20948_REG_PWR_MGMT_2,
 	.int_pin_cfg		= INV_ICM20948_REG_INT_PIN_CFG,
@@ -65,6 +81,320 @@ static const struct inv_icm_hw hw_info[] = {
 		.config = &chip_config_20948,
 		.fifo_size = 512,
 	},
+};
+
+static int inv_icm_sensor_set(struct inv_icm_state  *st, int reg,
+			      int axis, int val)
+{
+	int ind, result;
+	__be16 d = cpu_to_be16(val);
+
+	ind = (axis - IIO_MOD_X) * 2;
+	result = regmap_bulk_write(st->map, reg + ind, (u8 *)&d, 2);
+	if (result)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int inv_icm_sensor_show(struct inv_icm_state  *st, int reg,
+			       int axis, int *val)
+{
+	int ind, result;
+	__be16 d;
+
+	ind = (axis - IIO_MOD_X) * 2;
+	result = regmap_bulk_read(st->map, reg + ind, (u8 *)&d, 2);
+	if (result)
+		return -EINVAL;
+	*val = (short)be16_to_cpup(&d);
+
+	return IIO_VAL_INT;
+}
+
+static int inv_icm_read_channel_data(struct iio_dev *indio_dev,
+				     struct iio_chan_spec const *chan,
+				     int *val)
+{
+	struct inv_icm_state *st = iio_priv(indio_dev);
+	int result;
+	int ret;
+
+	result = inv_icm_set_power_itg(st, true);
+	if (result)
+		return result;
+
+	switch (chan->type) {
+	case IIO_ANGL_VEL:
+		result = inv_icm_switch_engine(st, true,
+					       INV_ICM20948_BIT_PWR_GYRO_STBY);
+		if (result)
+			goto error_power_off;
+		ret = inv_icm_sensor_show(st, st->reg->raw_gyro,
+					  chan->channel2, val);
+		result = inv_icm_switch_engine(st, false,
+					       INV_ICM20948_BIT_PWR_GYRO_STBY);
+		if (result)
+			goto error_power_off;
+		break;
+	case IIO_ACCEL:
+		result = inv_icm_switch_engine(st, true,
+					       INV_ICM20948_BIT_PWR_ACCL_STBY);
+		if (result)
+			goto error_power_off;
+		ret = inv_icm_sensor_show(st, st->reg->raw_accl,
+					  chan->channel2, val);
+		result = inv_icm_switch_engine(st, false,
+					       INV_ICM20948_BIT_PWR_ACCL_STBY);
+		if (result)
+			goto error_power_off;
+		break;
+	case IIO_TEMP:
+		/* wait for stablization */
+		msleep(INV_ICM20948_SENSOR_UP_TIME);
+		ret = inv_icm_sensor_show(st, st->reg->temperature,
+					  IIO_MOD_X, val);
+		break;
+	// TODO removed magnetometer here
+	default:
+		ret = -EINVAL;
+		break;
+	}
+
+	result = inv_icm_set_power_itg(st, false);
+	if (result)
+		goto error_power_off;
+
+	return ret;
+
+error_power_off:
+	inv_icm_set_power_itg(st, false);
+	return result;
+}
+
+static int inv_icm_read_raw(struct iio_dev *indio_dev,
+			    struct iio_chan_spec const *chan,
+			    int *val, int *val2, long mask)
+{
+	struct inv_icm_state  *st = iio_priv(indio_dev);
+	int ret = 0;
+
+	switch (mask) {
+	case IIO_CHAN_INFO_RAW:
+		ret = iio_device_claim_direct_mode(indio_dev);
+		if (ret)
+			return ret;
+		mutex_lock(&st->lock);
+		ret = inv_icm_read_channel_data(indio_dev, chan, val);
+		mutex_unlock(&st->lock);
+		iio_device_release_direct_mode(indio_dev);
+		return ret;
+	case IIO_CHAN_INFO_SCALE:
+		switch (chan->type) {
+		case IIO_ANGL_VEL:
+			mutex_lock(&st->lock);
+			*val  = 0;
+			*val2 = gyro_scale[st->chip_config.fsr];
+			mutex_unlock(&st->lock);
+
+			return IIO_VAL_INT_PLUS_NANO;
+		case IIO_ACCEL:
+			mutex_lock(&st->lock);
+			*val = 0;
+			*val2 = accel_scale[st->chip_config.accl_fs];
+			mutex_unlock(&st->lock);
+
+			return IIO_VAL_INT_PLUS_MICRO;
+		case IIO_TEMP:
+			*val = 0;
+			*val2 = INV_ICM20948_TEMP_SCALE;
+
+			return IIO_VAL_INT_PLUS_MICRO;
+		// TODO Removed magnetometer
+		default:
+			return -EINVAL;
+		}
+	case IIO_CHAN_INFO_OFFSET:
+		switch (chan->type) {
+		case IIO_TEMP:
+			*val = INV_ICM20948_TEMP_OFFSET;
+
+			return IIO_VAL_INT;
+		default:
+			return -EINVAL;
+		}
+	case IIO_CHAN_INFO_CALIBBIAS:
+		switch (chan->type) {
+		case IIO_ANGL_VEL:
+			mutex_lock(&st->lock);
+			ret = inv_icm_sensor_show(st, st->reg->gyro_offset,
+						chan->channel2, val);
+			mutex_unlock(&st->lock);
+			return IIO_VAL_INT;
+		case IIO_ACCEL:
+			mutex_lock(&st->lock);
+			ret = inv_icm_sensor_show(st, st->reg->accl_offset,
+						chan->channel2, val);
+			mutex_unlock(&st->lock);
+			return IIO_VAL_INT;
+
+		default:
+			return -EINVAL;
+		}
+	default:
+		return -EINVAL;
+	}
+}
+
+
+static int inv_icm_write_gyro_scale(struct inv_icm_state *st, int val)
+{
+	int result, i;
+	u8 d;
+
+	for (i = 0; i < ARRAY_SIZE(gyro_scale); ++i) {
+		if (gyro_scale[i] == val) {
+			d = (i << INV_ICM20948_GYRO_CONFIG_FSR_SHIFT);
+			result = regmap_write(st->map, st->reg->gyro_config, d);
+			if (result)
+				return result;
+
+			st->chip_config.fsr = i;
+			return 0;
+		}
+	}
+
+	return -EINVAL;
+}
+
+static int inv_write_raw_get_fmt(struct iio_dev *indio_dev,
+				 struct iio_chan_spec const *chan, long mask)
+{
+	switch (mask) {
+	case IIO_CHAN_INFO_SCALE:
+		switch (chan->type) {
+		case IIO_ANGL_VEL:
+			return IIO_VAL_INT_PLUS_NANO;
+		default:
+			return IIO_VAL_INT_PLUS_MICRO;
+		}
+	default:
+		return IIO_VAL_INT_PLUS_MICRO;
+	}
+
+	return -EINVAL;
+}
+
+static int inv_icm_write_accel_scale(struct inv_icm_state *st, int val)
+{
+	int result, i;
+	u8 d;
+
+	for (i = 0; i < ARRAY_SIZE(accel_scale); ++i) {
+		if (accel_scale[i] == val) {
+			d = (i << INV_ICM20948_ACCL_CONFIG_FSR_SHIFT);
+			result = regmap_write(st->map, st->reg->accl_config, d);
+			if (result)
+				return result;
+
+			st->chip_config.accl_fs = i;
+			return 0;
+		}
+	}
+
+	return -EINVAL;
+}
+
+static int inv_icm_write_raw(struct iio_dev *indio_dev,
+			     struct iio_chan_spec const *chan,
+			     int val, int val2, long mask)
+{
+	struct inv_icm_state  *st = iio_priv(indio_dev);
+	int result;
+
+	/*
+	 * we should only update scale when the chip is disabled, i.e.
+	 * not running
+	 */
+	result = iio_device_claim_direct_mode(indio_dev);
+	if (result)
+		return result;
+
+	mutex_lock(&st->lock);
+	result = inv_icm_set_power_itg(st, true);
+	if (result)
+		goto error_write_raw_unlock;
+
+	switch (mask) {
+	case IIO_CHAN_INFO_SCALE:
+		switch (chan->type) {
+		case IIO_ANGL_VEL:
+			result = inv_icm_write_gyro_scale(st, val2);
+			break;
+		case IIO_ACCEL:
+			result = inv_icm_write_accel_scale(st, val2);
+			break;
+		default:
+			result = -EINVAL;
+			break;
+		}
+		break;
+	case IIO_CHAN_INFO_CALIBBIAS:
+		switch (chan->type) {
+		case IIO_ANGL_VEL:
+			result = inv_icm_sensor_set(st,
+						    st->reg->gyro_offset,
+						    chan->channel2, val);
+			break;
+		case IIO_ACCEL:
+			result = inv_icm_sensor_set(st,
+						    st->reg->accl_offset,
+						    chan->channel2, val);
+			break;
+		default:
+			result = -EINVAL;
+			break;
+		}
+		break;
+	default:
+		result = -EINVAL;
+		break;
+	}
+
+	result |= inv_icm_set_power_itg(st, false);
+error_write_raw_unlock:
+	mutex_unlock(&st->lock);
+	iio_device_release_direct_mode(indio_dev);
+
+	return result;
+}
+
+/**
+ * inv_icm_validate_trigger() - validate_trigger callback for invensense
+ *                              ICM devices.
+ * @indio_dev: The IIO device
+ * @trig: The new trigger
+ *
+ * Returns: 0 if the 'trig' matches the trigger registered by the ICM
+ * device, -EINVAL otherwise.
+ */
+static int inv_icm_validate_trigger(struct iio_dev *indio_dev,
+					 struct iio_trigger *trig)
+{
+	struct inv_icm_state *st = iio_priv(indio_dev);
+
+	if (st->trig != trig)
+		return -EINVAL;
+
+	return 0;
+}
+
+static const struct iio_info icm_info = {
+	.read_raw = &inv_icm_read_raw,
+	.write_raw = &inv_icm_write_raw,
+	.write_raw_get_fmt = &inv_write_raw_get_fmt,
+	// TODO attributes were removed
+	.validate_trigger = inv_icm_validate_trigger,
 };
 
 int inv_icm_switch_engine(struct inv_icm_state *st, bool en, u32 mask)
@@ -435,6 +765,35 @@ int inv_icm_core_probe(struct regmap *regmap, int irq, const char *name,
 	dev_set_drvdata(dev, indio_dev);
 	indio_dev->dev.parent = dev;
 	indio_dev->name = name;
+
+	// TODO what is this ?
+	indio_dev->channels = inv_icm_channels;
+	indio_dev->num_channels = ARRAY_SIZE(inv_icm_channels);
+	indio_dev->available_scan_masks = inv_icm_scan_masks;
+
+	indio_dev->info = &icm_info;
+	indio_dev->modes = INDIO_BUFFER_TRIGGERED;
+
+	result = devm_iio_triggered_buffer_setup(dev, indio_dev,
+						 iio_pollfunc_store_time,
+						 inv_icm_read_fifo,
+						 NULL);
+	if (result) {
+		dev_err(dev, "configure buffer fail %d\n", result);
+		return result;
+	}
+	dev_err(dev, "configure buffer success %d\n", result);
+	result = inv_icm_probe_trigger(indio_dev, irq_type);
+	if (result) {
+		dev_err(dev, "trigger probe fail %d\n", result);
+		return result;
+	}
+
+	result = devm_iio_device_register(dev, indio_dev);
+	if (result) {
+		dev_err(dev, "IIO register fail %d\n", result);
+		return result;
+	}
 
 	return 0;
 }

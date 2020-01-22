@@ -6,6 +6,8 @@
 config INV_ICM_I2C
 	tristate "Invensense ICM devices (I2C)"
 	depends on I2C_MUX
+	select IIO_BUFFER
+	select IIO_TRIGGERED_BUFFER
 	select REGMAP_I2C
 	help
 	  This driver supports the Invensense ICM20948 motion tracking
