@@ -283,3 +283,16 @@
 	 */
 	phy-supply = <&hdmi_5v>;
 };
+
+&i2c_AO {
+	status = "okay";
+	pinctrl-0 = <&i2c_ao_pins>;
+	pinctrl-names = "default";
+
+	icm20948@68 {
+		compatible = "invensense,icm20948";
+		reg = <0x68>;
+		interrupt-parent = <&gpio_intc>;
+		interrupts = <108 IRQ_TYPE_LEVEL_HIGH>;
+	};
+};
